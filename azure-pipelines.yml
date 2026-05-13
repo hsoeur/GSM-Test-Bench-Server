@@ -68,9 +68,12 @@ stages:
               archiveFile: $(Build.ArtifactStagingDirectory)/$(packageName)
               replaceExistingArchive: true
 
-          - publish: $(Build.ArtifactStagingDirectory)/$(packageName)
+          - task: PublishBuildArtifacts@1
             displayName: Publish artifact
-            artifact: $(artifactName)
+            inputs:
+              PathtoPublish: $(Build.ArtifactStagingDirectory)/$(packageName)
+              ArtifactName: $(artifactName)
+              publishLocation: Container
 
   - stage: Deploy
     displayName: Deploy to Linux
@@ -88,8 +91,13 @@ stages:
           runOnce:
             deploy:
               steps:
-                - download: current
-                  artifact: $(artifactName)
+                - task: DownloadBuildArtifacts@0
+                  displayName: Download artifact
+                  inputs:
+                    buildType: current
+                    downloadType: single
+                    artifactName: $(artifactName)
+                    downloadPath: $(System.ArtifactsDirectory)
 
                 - task: SSH@0
                   displayName: Prepare remote directory
@@ -105,7 +113,7 @@ stages:
                   displayName: Copy package to target
                   inputs:
                     sshEndpoint: $(sshServiceConnection)
-                    sourceFolder: $(Pipeline.Workspace)/$(artifactName)
+                    sourceFolder: $(System.ArtifactsDirectory)/$(artifactName)
                     contents: $(packageName)
                     targetFolder: $(remoteTempPath)
                     cleanTargetFolder: false
