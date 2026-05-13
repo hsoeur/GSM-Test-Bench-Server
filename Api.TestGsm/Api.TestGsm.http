@@ -1,0 +1,72 @@
+Sure, here is the rewritten file that incorporates the suggested code changes:
+
+````````
+@Api.TestGsm_HostAddress = http://localhost:5001
+
+### Health Check (vérifier le statut de l'API et du modem)
+GET {{Api.TestGsm_HostAddress}}/api/gsm/health
+Accept: application/json
+
+###
+
+### Initialisation du Module GSM
+POST {{Api.TestGsm_HostAddress}}/api/gsm/init
+Content-Type: application/json
+
+###
+
+### Lancer un Appel de Test (avec audio OK)
+POST {{Api.TestGsm_HostAddress}}/api/gsm/call
+Content-Type: application/json
+
+{
+  "phoneNumber": "+33612345678",
+  "audioOk": true
+}
+
+###
+
+### Lancer un Appel de Test (sans vérification audio)
+POST {{Api.TestGsm_HostAddress}}/api/gsm/call
+Content-Type: application/json
+
+{
+  "phoneNumber": "+33698765432",
+  "audioOk": false
+}
+
+###
+
+### Raccrocher l'Appel
+POST {{Api.TestGsm_HostAddress}}/api/gsm/hangup
+Content-Type: application/json
+
+###
+
+### Workflow Complet de Test
+# 1. Health Check
+GET {{Api.TestGsm_HostAddress}}/api/gsm/health
+
+###
+
+# 2. Initialisation
+POST {{Api.TestGsm_HostAddress}}/api/gsm/init
+
+###
+
+# 3. Appel avec Audio
+POST {{Api.TestGsm_HostAddress}}/api/gsm/call
+Content-Type: application/json
+
+{
+  "phoneNumber": "+33612345678",
+  "audioOk": true
+}
+
+###
+
+# 4. Raccrocher
+POST {{Api.TestGsm_HostAddress}}/api/gsm/hangup
+
+###
+````````

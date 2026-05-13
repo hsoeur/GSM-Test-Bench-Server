@@ -1,0 +1,637 @@
+using Microsoft.Extensions.Options;
+using System.IO.Ports;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace Api.TestGsm.Services;
+
+public class GsmService : IGsmService, IDisposable
+{
+    private readonly SerialPort _serialPort;
+    private readonly string _portName;
+    private readonly ILogger<GsmService> _logger;
+    private readonly object _serialLock = new();
+    private volatile bool _callCommandInProgress;
+    private volatile bool _callActive;
+
+    private const int TIME_OUT_2SEC = 2000;
+    private const int TIME_OUT_5SEC = 5000;
+    private const int TIME_OUT_10SEC = 10000;
+    private const int TIME_OUT_15SEC = 15000;
+    private const int TIME_OUT_25SEC = 25000;
+
+    public GsmService(IOptions<GsmOptions> options, ILogger<GsmService> logger)
+    {
+        _logger = logger;
+
+        var cfg = options.Value ?? new GsmOptions();
+
+        // Choose default port per OS; override via configuration: Gsm:PortName
+        var defaultPort = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "COM3" : "/dev/ttyUSB0";
+        _portName = string.IsNullOrWhiteSpace(cfg.PortName) ? defaultPort : cfg.PortName;
+
+        _serialPort = new SerialPort(_portName)
+        {
+            BaudRate = cfg.BaudRate ?? 9600,
+            DataBits = cfg.DataBits ?? 8,
+            StopBits = TryParseEnum(cfg.StopBits, StopBits.One),
+            Parity = TryParseEnum(cfg.Parity, Parity.None),
+            Handshake = TryParseEnum(cfg.Handshake, Handshake.None),
+            NewLine = string.IsNullOrEmpty(cfg.NewLine) ? "\n" : cfg.NewLine,
+            ReadTimeout = cfg.ReadTimeout ?? 5000,
+            WriteTimeout = cfg.WriteTimeout ?? 5000
+        };
+        _logger.LogInformation("Configured serial port {Port} BaudRate={BaudRate} DataBits={DataBits} StopBits={StopBits} Parity={Parity} Handshake={Handshake} NewLine={NewLine} ReadTimeout={ReadTimeout} WriteTimeout={WriteTimeout}",
+            _portName, _serialPort.BaudRate, _serialPort.DataBits, _serialPort.StopBits, _serialPort.Parity, _serialPort.Handshake, _serialPort.NewLine, _serialPort.ReadTimeout, _serialPort.WriteTimeout);
+        // Do not open here - open on demand to avoid errors on dev machines without the device
+    }
+
+    private static TEnum TryParseEnum<TEnum>(string? value, TEnum fallback) where TEnum : struct, Enum
+    => Enum.TryParse<TEnum>(value, ignoreCase: true, out var parsed) ? parsed : fallback;
+
+    private void EnsureOpen()
+    {
+        if (_serialPort.IsOpen) return;
+        try
+        {
+            _serialPort.PortName = _portName;
+            _logger.LogInformation("Attempting to open serial port {Port} with BaudRate={BaudRate}", _portName, _serialPort.BaudRate);
+            _serialPort.Open();
+
+            // Give the modem time to initialize after opening the port
+            Thread.Sleep(500);
+
+            _logger.LogInformation("Opened serial port {Port}", _portName);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            _logger.LogError(ex, "Access denied to serial port {Port}. Port may be in use by another application.", _portName);
+            throw new InvalidOperationException($"Serial port '{_portName}' is already in use or access is denied: {ex.Message}", ex);
+        }
+        catch (IOException ex)
+        {
+            _logger.LogError(ex, "Serial port {Port} not found or cannot be opened", _portName);
+            throw new InvalidOperationException($"Serial port '{_portName}' not found or unavailable: {ex.Message}", ex);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to open serial port {Port}", _portName);
+            throw new InvalidOperationException($"Failed to open serial port '{_portName}': {ex.Message}", ex);
+        }
+    }
+
+    public void TestBenchInitialization()
+    {
+        lock (_serialLock)
+        {
+            try
+            {
+                _callActive = false;
+                _logger.LogInformation("Starting test bench initialization");
+                ExecGsmCommand("AT\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT+CMEE=2\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT+CPIN?\r", "\r\n+CPIN: READY\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("ATZ\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                // Accept both with and without echo
+                ExecGsmCommandAny("ATE0&W\r", new[] { "ATE0&W\r\r\nOK\r\n", "\r\nOK\r\n" }, TIME_OUT_2SEC);
+                ExecGsmCommand("AT+CRC=1\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT+COLP=0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT+DDET=0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT+CHFA=2\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT+SIDET=2,0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT+CEXTERNTONE=0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT+ECHO?\r", "\r\n+ECHO: (0,96,253,16388,20488),(1,96,224,5256,20488)\r\n\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT+CMGF=1\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT+CSCS=\"IRA\"\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT+CREG?\r", "\r\n+CREG:0,1\r\n\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT+CGREG?\r", "\r\n+CGREG:0,1\r\n\r\nOK\r\n", TIME_OUT_2SEC);
+                _logger.LogInformation("Test bench initialization completed");
+            }
+            catch
+            {
+                // ensure we leave port in sane state
+                try { ExecGsmCommand("AT+DDET=0\r", string.Empty, 0); } catch { }
+                _logger.LogWarning("Initialization failed; ensured DTMF detection is disabled");
+                throw;
+            }
+        }
+    }
+
+    public void FourGModuleInitialization()
+    {
+        lock (_serialLock)
+        {
+            try
+            {
+                _callActive = false;
+                _logger.LogInformation("Starting 4G module initialization");
+
+                ExecGsmCommandAny("ATE0\r", new[] { "ATE0\r\r\nOK\r\n", "\r\nOK\r\n" }, TIME_OUT_2SEC);
+                ExecGsmCommand("AT+CPIN?\r", "\r\n+CPIN: READY\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT#ADSPC=1,0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT#DVICFG=0,1,2,1,2\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT#DVICFG=1,1,2,1,2\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT#DVI=1,2,1\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT#DVICLK=512,0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+
+                ExecI2cWrite("AT#I2CWR=3,2,30,4,19\r", "00101000240140002077404010502A0A400007\x1A", TIME_OUT_5SEC);
+                ExecI2cWrite("AT#I2CWR=3,2,30,17,1\r", "8A\x1A", TIME_OUT_5SEC);
+
+                ExecGsmCommand("AT+CVHU=0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecGsmCommand("AT#DIALMODE=2\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+
+                ValidateCommandResponse("AT+CSQ\r", "+CSQ:", TIME_OUT_5SEC);
+                ValidateCommandResponse("AT+CREG?\r", "+CREG:", TIME_OUT_5SEC);
+
+                // Try CEREG but don't fail if not supported
+                try
+                {
+                    ValidateCommandResponse("AT+CEREG?\r", "+CEREG:", TIME_OUT_5SEC);
+                    _logger.LogInformation("CEREG command supported");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "CEREG command not supported or failed - continuing initialization");
+                }
+
+                ExecGsmCommand("AT#HFMICG=0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+
+                _logger.LogInformation("4G module initialization completed");
+            }
+            catch
+            {
+                _logger.LogWarning("4G module initialization failed");
+                throw;
+            }
+        }
+    }
+
+    public void LaunchTest(string phoneNumber, bool audioOk)
+    {
+        lock (_serialLock)
+        {
+            _logger.LogInformation("Launching test call to {PhoneNumber} (audioOk={AudioOk})", phoneNumber, audioOk);
+            _callCommandInProgress = true;
+            _callActive = false;
+            try
+            {
+                ExecGsmCommandAny(
+                    BuildVoiceDialCommand(phoneNumber),
+                    new[] { "\r\nCONNECTED\r\n", "CONNECTED\r\n" },
+                    TIME_OUT_25SEC);
+
+                _callActive = true;
+                _logger.LogInformation("Call to {PhoneNumber} connected", phoneNumber);
+
+                if (audioOk)
+                {
+                    try
+                    {
+                        ExecGsmCommand("AT+DDET=1\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                        // Accept OK-only (most modems) and optional +DTMF URC variants (vendor-dependent)
+                        ExecGsmCommandAny("AT+VTS=1\r",
+                            new[]
+                            {
+                                "\r\nOK\r\n",
+                                "\r\nOK\r\n\r\n+DTMF:1\r\n",
+                                "\r\nOK\r\n\r\n+DTMF:#\r\n",
+                                "\r\nOK\r\n\r\n+DTMF: #\r\n"
+                            },
+                            TIME_OUT_5SEC);
+                        ExecGsmCommand("AT+DDET=0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Call is connected, but audio marker command failed");
+                        try { ExecGsmCommand("AT+DDET=0\r", string.Empty, 0); } catch { }
+                    }
+                }
+                // Do not hang up automatically; leave the call active for manual hangup via the endpoint
+
+                _logger.LogInformation("Test call completed successfully");
+            }
+            catch (Exception ex)
+            {
+                _callActive = false;
+                _logger.LogError(ex, "Test call failed");
+                try { ExecGsmCommand("AT+DDET=0\r", string.Empty, 0); } catch { }
+                _logger.LogWarning("Test call encountered an error; ensured DTMF detection is disabled");
+                throw;
+            }
+            finally
+            {
+                _callCommandInProgress = false;
+            }
+        }
+    }
+
+    public void HangUpCall()
+    {
+        lock (_serialLock)
+        {
+            _logger.LogInformation("Hanging up call");
+            ExecGsmCommand("+++\r", string.Empty, 0);
+            ExecGsmCommand("ATH\r", string.Empty, 0);
+            _callActive = false;
+            _callCommandInProgress = false;
+        }
+    }
+
+    // Health
+    public bool IsPortOpen() => _serialPort.IsOpen;
+
+    public bool PingModem()
+    {
+        if (_callCommandInProgress || _callActive)
+        {
+            _logger.LogDebug("Skipping modem ping while a call is in progress or active");
+            return _serialPort.IsOpen;
+        }
+
+        lock (_serialLock)
+        {
+            try
+            {
+                if (_callCommandInProgress || _callActive)
+                {
+                    _logger.LogDebug("Skipping modem ping while a call is in progress or active");
+                    return _serialPort.IsOpen;
+                }
+
+                _logger.LogDebug("Pinging modem");
+
+                // Don't ping if port is not open yet
+                if (!_serialPort.IsOpen)
+                {
+                    _logger.LogDebug("Port not open, skipping ping");
+                    return false;
+                }
+
+                ExecGsmCommand("AT\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                _logger.LogInformation("Modem responded to ping");
+                return true;
+            }
+            catch (TimeoutException ex)
+            {
+                _logger.LogDebug(ex, "Modem ping timeout (normal during active call)");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Modem did not respond to ping");
+                return false;
+            }
+        }
+    }
+
+    private static string BuildVoiceDialCommand(string phoneNumber)
+    {
+        var normalizedPhoneNumber = phoneNumber.Trim().TrimEnd(';');
+        return $"ATDT{normalizedPhoneNumber};\r";
+    }
+
+    private void WriteOnSerialPort(byte[] data)
+    {
+        EnsureOpen();
+        _serialPort.DiscardInBuffer();
+        try
+        {
+            string text = Encoding.ASCII.GetString(data);
+            _logger.LogDebug("TX -> {Port}: {Text}", _portName, text.Replace("\r", "\\r").Replace("\n", "\\n"));
+            _serialPort.Write(data, 0, data.Length);
+            _serialPort.BaseStream.Flush();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Serial write failed on {Port}", _portName);
+            throw new InvalidOperationException($"Serial write failed: {ex.Message}", ex);
+        }
+    }
+
+    private bool WaitResponse(out string response, out string error, int timeoutMs)
+    {
+        EnsureOpen();
+
+        response = string.Empty;
+        error = string.Empty;
+
+        if (timeoutMs <= 0)
+        {
+            return true;
+        }
+
+        var deadline = Environment.TickCount64 + timeoutMs;
+        var buffer = new List<byte>(128);
+        byte last = 0;
+
+        while (Environment.TickCount64 <= deadline)
+        {
+            try
+            {
+                // Check if data is available before attempting to read
+                while (_serialPort.BytesToRead > 0)
+                {
+                    int b = _serialPort.ReadByte();
+                    if (b < 0) break;
+                    last = (byte)b;
+                    buffer.Add((byte)b);
+                    if (last == (byte)'\n')
+                    {
+                        // keep reading until we gathered as many lines as needed by ExecGsmCommand
+                        // Here we stop at newline like the C++ inner loop
+                        response = Encoding.ASCII.GetString(buffer.ToArray());
+                        _logger.LogDebug("RX <- {Port}: {Text}", _portName, response.Replace("\r", "\\r").Replace("\n", "\\n"));
+                        return true;
+                    }
+                }
+            }
+            catch (TimeoutException)
+            {
+                // ReadByte timed out, continue polling
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error reading from serial port {Port}", _portName);
+                error = $"Read error: {ex.Message}";
+                return false;
+            }
+
+            Thread.Sleep(10);  // Increased from 1ms to reduce CPU usage
+        }
+
+        error = "Error time out";
+        _logger.LogWarning("RX timeout on {Port} after {TimeoutMs} ms", _portName, timeoutMs);
+        return false;
+    }
+
+    private bool WaitForText(string expectedText, out string response, out string error, int timeoutMs)
+    {
+        EnsureOpen();
+
+        response = string.Empty;
+        error = string.Empty;
+
+        if (timeoutMs <= 0)
+        {
+            return true;
+        }
+
+        var deadline = Environment.TickCount64 + timeoutMs;
+        var buffer = new List<byte>(128);
+        while (Environment.TickCount64 <= deadline)
+        {
+            while (_serialPort.BytesToRead > 0)
+            {
+                int b = _serialPort.ReadByte();
+                if (b < 0) break;
+
+                buffer.Add((byte)b);
+                response = Encoding.ASCII.GetString(buffer.ToArray());
+                if (response.Contains(expectedText, StringComparison.Ordinal))
+                {
+                    _logger.LogDebug("RX <- {Port}: {Text}", _portName, response.Replace("\r", "\\r").Replace("\n", "\\n"));
+                    return true;
+                }
+            }
+
+            Thread.Sleep(1);
+        }
+
+        error = "Error time out";
+        _logger.LogWarning("RX timeout waiting for {ExpectedText} on {Port} after {TimeoutMs} ms", expectedText, _portName, timeoutMs);
+        return false;
+    }
+
+    private static string NormalizeNoWhitespace(string s)
+    {
+        var sb = new StringBuilder(s.Length);
+        foreach (var ch in s)
+        {
+            if (!char.IsWhiteSpace(ch)) sb.Append(ch);
+        }
+        return sb.ToString();
+    }
+
+    private void ExecGsmCommand(string command, string expectedResponse, int receiveTimeOut)
+        => ExecGsmCommandAny(command, new[] { expectedResponse }, receiveTimeOut);
+
+    private void ExecGsmCommandAny(string command, string[] expectedResponses, int receiveTimeOut)
+    {
+        // Ensure port is open
+        if (!string.IsNullOrEmpty(command) || (expectedResponses?.Length ?? 0) > 0)
+        {
+            EnsureOpen();
+        }
+
+        var respBuilder = new StringBuilder();
+
+        if (!string.IsNullOrEmpty(command))
+        {
+            WriteOnSerialPort(Encoding.ASCII.GetBytes(command));
+        }
+
+        if (expectedResponses != null && expectedResponses.Length > 0)
+        {
+            // Read with slack to absorb extra echoes or blank lines
+            var expectedLines = expectedResponses.Max(r => r.Count(c => c == '\n'));
+            var maxLinesToRead = expectedLines + 5;
+
+            string? matchedVariant = null;
+            for (int i = 0; i < maxLinesToRead; i++)
+            {
+                if (WaitResponse(out var read, out var err, receiveTimeOut))
+                {
+                    respBuilder.Append(read);
+
+                    var aggregated = respBuilder.ToString();
+                    var normAggregated = NormalizeNoWhitespace(aggregated);
+
+                    foreach (var exp in expectedResponses)
+                    {
+                        var normExpLocal = NormalizeNoWhitespace(exp);
+                        if (normAggregated.Contains(normExpLocal, StringComparison.Ordinal))
+                        {
+                            matchedVariant = exp;
+                            break;
+                        }
+                    }
+
+                    if (matchedVariant != null)
+                    {
+                        _logger.LogDebug("Response matched for [{Command}]", command.Replace("\r", "\\r"));
+                        return;
+                    }
+                }
+                else
+                {
+                    _logger.LogError("Command timeout for [{Command}] after {TimeoutMs} ms", command.Replace("\r", "\\r"), receiveTimeOut);
+                    throw new InvalidOperationException($"{err} [{command}]");
+                }
+            }
+
+            // No match after slack lines
+            string resp = respBuilder.ToString();
+            var normResp = resp.Replace("\r", "\\r").Replace("\n", "\\n");
+            var normExp = string.Join(" || ", expectedResponses.Select(e => e.Replace("\r", "\\r").Replace("\n", "\\n")));
+            _logger.LogError("Incorrect response for [{Command}] => got: {Got} expected: {Expected}", command.Replace("\r", "\\r"), normResp, normExp);
+            throw new InvalidOperationException($"incorrect response: {normResp}<>${normExp}");
+        }
+    }
+
+    private void ExecI2cWrite(string command, string payload, int receiveTimeOut)
+    {
+        EnsureOpen();
+        WriteOnSerialPort(Encoding.ASCII.GetBytes(command));
+
+        if (!WaitForText(">", out var promptResponse, out var promptError, receiveTimeOut))
+        {
+            _logger.LogError("I2C write prompt timeout for [{Command}] after {TimeoutMs} ms", command.Replace("\r", "\\r"), receiveTimeOut);
+            throw new InvalidOperationException($"{promptError} [{command}]");
+        }
+
+        _logger.LogDebug("I2C write prompt received for [{Command}]: {Response}", command.Replace("\r", "\\r"), promptResponse.Replace("\r", "\\r").Replace("\n", "\\n"));
+        ExecGsmCommand(payload, "\r\nOK\r\n", receiveTimeOut);
+    }
+
+    private void ValidateCommandResponse(string command, string requiredText, int totalTimeoutMs)
+    {
+        var response = ExecAndRead(command, totalTimeoutMs);
+
+        _logger.LogDebug("ValidateCommandResponse - Command: {Command}, RequiredText: {RequiredText}, Response: {Response}",
+            command.Replace("\r", "\\r"),
+            requiredText,
+            response.Replace("\r", "\\r").Replace("\n", "\\n"));
+
+        if (!response.Contains(requiredText, StringComparison.OrdinalIgnoreCase) ||
+            !response.Contains("\r\nOK\r\n", StringComparison.Ordinal))
+        {
+            _logger.LogError(
+                "Incorrect response for [{Command}] => got: {Got} expected text: {ExpectedText} and OK",
+                command.Replace("\r", "\\r"),
+                response.Replace("\r", "\\r").Replace("\n", "\\n"),
+                requiredText);
+            throw new InvalidOperationException($"incorrect response: {response}<>${requiredText}");
+        }
+
+        _logger.LogInformation("Command {Command} validated successfully", command.Replace("\r", "\\r"));
+    }
+
+    // Helpers
+    private string ExecAndRead(string command, int totalTimeoutMs)
+    {
+        EnsureOpen();
+        if (!string.IsNullOrEmpty(command))
+        {
+            WriteOnSerialPort(Encoding.ASCII.GetBytes(command));
+        }
+
+        var sb = new StringBuilder();
+        var deadline = Environment.TickCount64 + totalTimeoutMs;
+        var iterations = 0;
+        const int maxIterations = 100; // Safety limit
+
+        while (Environment.TickCount64 <= deadline && iterations < maxIterations)
+        {
+            iterations++;
+
+            try
+            {
+                if (WaitResponse(out var line, out _, 1000))
+                {
+                    sb.Append(line);
+                    var agg = sb.ToString();
+                    if (agg.Contains("\r\nOK\r\n", StringComparison.Ordinal) ||
+                        agg.Contains("\r\nERROR\r\n", StringComparison.Ordinal))
+                    {
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "ExecAndRead iteration {Iteration} error", iterations);
+            }
+        }
+
+        var res = sb.ToString();
+        _logger.LogDebug("ExecAndRead aggregated after {Iterations} iterations: {Text}",
+            iterations,
+            res.Replace("\r", "\\r").Replace("\n", "\\n"));
+        return res;
+    }
+
+    private static bool TryParseClccStat(string line, out int stat)
+    {
+        stat = -1;
+        var idx = line.IndexOf("+CLCC:", StringComparison.OrdinalIgnoreCase);
+        if (idx < 0) return false;
+        var rest = line[(idx + 6)..];
+        var tokens = rest.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (tokens.Length >= 3 && int.TryParse(tokens[2], out stat)) return true;
+        return false;
+    }
+
+    private bool WaitForVoiceConnected(int timeoutMs)
+    {
+        var deadline = Environment.TickCount64 + timeoutMs;
+        var callAttempts = 0;
+        const int maxCallAttempts = 25;  // Avoid infinite loop
+
+        while (Environment.TickCount64 <= deadline && callAttempts < maxCallAttempts)
+        {
+            callAttempts++;
+
+            try
+            {
+                var resp = ExecAndRead("AT+CLCC\r", TIME_OUT_5SEC);  // Increased from 2 to 5 seconds
+
+                _logger.LogDebug("WaitForVoiceConnected attempt {Attempt}: {Response}",
+                    callAttempts,
+                    resp.Replace("\r", "\\r").Replace("\n", "\\n"));
+
+                foreach (var line in resp.Split('\n'))
+                {
+                    if (line.Contains("+CLCC:", StringComparison.OrdinalIgnoreCase) && TryParseClccStat(line, out var stat))
+                    {
+                        // stat:0=active,2=dialing,3=alerting,4=incoming,5=waiting
+                        if (stat == 0)
+                        {
+                            _logger.LogInformation("Call is connected (CLCC stat=0)");
+                            return true;
+                        }
+                        else
+                        {
+                            _logger.LogDebug("Call status: stat={Stat}", stat);
+                        }
+                    }
+                    if (line.Contains("NO CARRIER", StringComparison.OrdinalIgnoreCase) ||
+                        line.Contains("BUSY", StringComparison.OrdinalIgnoreCase) ||
+                        line.Contains("NO ANSWER", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _logger.LogWarning("Call failed: {Line}", line.Trim());
+                        return false;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error checking call status on attempt {Attempt}", callAttempts);
+            }
+
+            Thread.Sleep(500);
+        }
+
+        _logger.LogWarning("Call did not connect after {Attempts} attempts / {TimeoutMs}ms", callAttempts, timeoutMs);
+        return false;
+    }
+
+    public void Dispose()
+    {
+        if (_serialPort.IsOpen)
+        {
+            try { _serialPort.Close(); _logger.LogInformation("Closed serial port {Port}", _portName); } catch { }
+        }
+
+        _serialPort.Dispose();
+    }
+}
