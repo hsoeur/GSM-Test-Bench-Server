@@ -25,18 +25,18 @@ namespace Api.TestGsm.Controllers
         {
             try
             {
-         _gsm.FourGModuleInitialization();
- return Ok(new { success = true, message = "4G module initialized successfully" });
+                _gsm.FourGModuleInitialization();
+                return Ok(new { success = true, message = "4G module initialized successfully" });
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("time out"))
+            {
+                return StatusCode(504, new { success = false, error = "Modem timeout", details = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { success = false, error = "Initialization failed", details = ex.Message });
+            }
         }
-    catch (InvalidOperationException ex) when (ex.Message.Contains("time out"))
-        {
-        return StatusCode(504, new { success = false, error = "Modem timeout", details = ex.Message });
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, new { success = false, error = "Initialization failed", details = ex.Message });
-        }
-    }
 
         public record CallRequest(string phoneNumber, bool audioOk);
         [HttpPost("call")]

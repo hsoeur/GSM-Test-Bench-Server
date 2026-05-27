@@ -205,7 +205,7 @@ public class GsmSimulatorService : IGsmService, IDisposable
     {
         _logger.LogTrace("Simulated TX -> {Command}", command.Replace("\r", "\\r"));
 
-        // Small delay to simulate serial communication
+            
         if (_options.CommandDelayMs > 0)
         {
             Thread.Sleep(_options.CommandDelayMs);

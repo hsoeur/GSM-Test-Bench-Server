@@ -173,11 +173,12 @@ public class GsmService : IGsmService, IDisposable
             _logger.LogInformation("Launching test call to {PhoneNumber} (audioOk={AudioOk})", phoneNumber, audioOk);
             _callCommandInProgress = true;
             _callActive = false;
+
             try
             {
                 ExecGsmCommandAny(
                     BuildVoiceDialCommand(phoneNumber),
-                    new[] { "\r\nCONNECTED\r\n", "CONNECTED\r\n" },
+                    new[] { "\r\nCONNECTED\r\n", "CONNECTED\r\n", "\r\nOK\r\n" },
                     TIME_OUT_25SEC);
 
                 _callActive = true;
@@ -188,16 +189,20 @@ public class GsmService : IGsmService, IDisposable
                     try
                     {
                         ExecGsmCommand("AT+DDET=1\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+
                         // Accept OK-only (most modems) and optional +DTMF URC variants (vendor-dependent)
                         ExecGsmCommandAny("AT+VTS=1\r",
                             new[]
                             {
+
                                 "\r\nOK\r\n",
                                 "\r\nOK\r\n\r\n+DTMF:1\r\n",
                                 "\r\nOK\r\n\r\n+DTMF:#\r\n",
                                 "\r\nOK\r\n\r\n+DTMF: #\r\n"
+
                             },
                             TIME_OUT_5SEC);
+
                         ExecGsmCommand("AT+DDET=0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
                     }
                     catch (Exception ex)
@@ -206,7 +211,6 @@ public class GsmService : IGsmService, IDisposable
                         try { ExecGsmCommand("AT+DDET=0\r", string.Empty, 0); } catch { }
                     }
                 }
-                // Do not hang up automatically; leave the call active for manual hangup via the endpoint
 
                 _logger.LogInformation("Test call completed successfully");
             }
