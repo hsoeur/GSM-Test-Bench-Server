@@ -132,6 +132,7 @@ stages:
                   inputs:
                     sshEndpoint: $(sshServiceConnection)
                     runOptions: inline
+                    failOnStdErr: false
                     inline: |
                       set -euo pipefail
 
