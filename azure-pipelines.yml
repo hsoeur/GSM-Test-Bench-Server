@@ -1,0 +1,207 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  buildConfiguration: Release
+  dotnetSdkVersion: 9.x
+  agentPoolName: Default
+  agentName: VM-DEVOPS
+  projectPath: Api.TestGsm/Api.TestGsm.csproj
+  solutionPath: Api.TestGsm.sln
+  artifactName: api-test-gsm
+  packageName: api-test-gsm.tar.gz
+  remoteTempPath: /tmp/api-test-gsm
+  remoteAppRoot: /opt/ApiTestGsm
+  remoteAppPath: /opt/ApiTestGsm/publish
+  systemdServiceName: api-testgsm.service
+  serviceUser: aprod
+  sshServiceConnection: prod-linux-test-gsm-2
+
+stages:
+  - stage: Build
+    displayName: Build and package
+    jobs:
+      - job: Build
+        displayName: Build API
+        pool:
+          name: $(agentPoolName)
+          demands:
+            - agent.name -equals $(agentName)
+        steps:
+          - task: UseDotNet@2
+            displayName: Install .NET SDK
+            inputs:
+              packageType: sdk
+              version: $(dotnetSdkVersion)
+
+          - task: DotNetCoreCLI@2
+            displayName: Restore
+            inputs:
+              command: restore
+              projects: $(solutionPath)
+
+          - task: DotNetCoreCLI@2
+            displayName: Test
+            inputs:
+              command: test
+              projects: $(solutionPath)
+              arguments: --configuration $(buildConfiguration) --no-restore
+
+          - task: DotNetCoreCLI@2
+            displayName: Publish
+            inputs:
+              command: publish
+              publishWebProjects: false
+              projects: $(projectPath)
+              arguments: --configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/publish --no-restore /p:UseAppHost=false
+              zipAfterPublish: false
+              modifyOutputPath: false
+
+          - task: ArchiveFiles@2
+            displayName: Create deployment package
+            inputs:
+              rootFolderOrFile: $(Build.ArtifactStagingDirectory)/publish
+              includeRootFolder: false
+              archiveType: tar
+              tarCompression: gz
+              archiveFile: $(Build.ArtifactStagingDirectory)/$(packageName)
+              replaceExistingArchive: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: Publish artifact
+            inputs:
+              PathtoPublish: $(Build.ArtifactStagingDirectory)/$(packageName)
+              ArtifactName: $(artifactName)
+              publishLocation: Container
+
+  - stage: Deploy
+    displayName: Deploy to Linux
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - deployment: DeployProduction
+        displayName: Deploy API
+        environment: production
+        pool:
+          name: $(agentPoolName)
+          demands:
+            - agent.name -equals $(agentName)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@0
+                  displayName: Download artifact
+                  inputs:
+                    buildType: current
+                    downloadType: single
+                    artifactName: $(artifactName)
+                    downloadPath: $(System.ArtifactsDirectory)
+
+                - task: SSH@0
+                  displayName: Prepare remote directory
+                  inputs:
+                    sshEndpoint: $(sshServiceConnection)
+                    runOptions: inline
+                    inline: |
+                      set -euo pipefail
+                      mkdir -p "$(remoteTempPath)"
+                      rm -f "$(remoteTempPath)/$(packageName)"
+
+                - task: CopyFilesOverSSH@0
+                  displayName: Copy package to target
+                  inputs:
+                    sshEndpoint: $(sshServiceConnection)
+                    sourceFolder: $(System.ArtifactsDirectory)/$(artifactName)
+                    contents: $(packageName)
+                    targetFolder: $(remoteTempPath)
+                    cleanTargetFolder: false
+                    overwrite: true
+
+                - task: SSH@0
+                  displayName: Install and restart service
+                  inputs:
+                    sshEndpoint: $(sshServiceConnection)
+                    runOptions: inline
+                    inline: |
+                      set -euo pipefail
+
+                      PACKAGE="$(remoteTempPath)/$(packageName)"
+                      APP_ROOT="$(remoteAppRoot)"
+                      PUBLISH_DIR="$(remoteAppPath)"
+                      LOG_DIR="$(remoteAppRoot)/logs"
+                      SERVICE_FILE="/etc/systemd/system/$(systemdServiceName)"
+
+                      test -f "$PACKAGE" || {
+                        echo "Archive introuvable : $PACKAGE" >&2
+                        exit 1
+                      }
+
+                      if ! command -v dotnet >/dev/null 2>&1 \
+                        || ! dotnet --list-runtimes 2>/dev/null | grep -q '^Microsoft\.NETCore\.App 8\.' \
+                        || ! dotnet --list-runtimes 2>/dev/null | grep -q '^Microsoft\.AspNetCore\.App 8\.'; then
+                        sudo apt-get update
+                        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y dotnet-runtime-8.0 aspnetcore-runtime-8.0
+                      fi
+
+                      id "$(serviceUser)" >/dev/null 2>&1 || {
+                        echo "Utilisateur systemd introuvable : $(serviceUser)" >&2
+                        exit 1
+                      }
+
+                      while IFS= read -r entry; do
+                        case "$entry" in
+                          /*|../*|*/../*|*/..) echo "Chemin interdit dans l'archive : $entry" >&2; exit 1 ;;
+                        esac
+                      done < <(tar -tzf "$PACKAGE")
+
+                      sudo mkdir -p "$APP_ROOT" "$LOG_DIR"
+                      sudo systemctl stop "$(systemdServiceName)" 2>/dev/null || true
+                      sudo rm -rf "$PUBLISH_DIR"
+                      sudo mkdir -p "$PUBLISH_DIR"
+                      sudo tar -xzf "$PACKAGE" -C "$PUBLISH_DIR"
+
+                      test -f "$PUBLISH_DIR/Api.TestGsm.dll" || {
+                        echo "DLL introuvable après extraction : $PUBLISH_DIR/Api.TestGsm.dll" >&2
+                        exit 1
+                      }
+
+                      sudo rm -rf "$PUBLISH_DIR/logs"
+                      sudo ln -s ../logs "$PUBLISH_DIR/logs"
+                      sudo chown -R "$(serviceUser):$(serviceUser)" "$APP_ROOT"
+                      sudo find "$APP_ROOT" -type d -exec chmod 775 {} \;
+
+                      printf '%s\n' \
+                        '[Unit]' \
+                        'Description=ASP.NET Core API - Test GSM' \
+                        'After=network.target' \
+                        '' \
+                        '[Service]' \
+                        'WorkingDirectory=$(remoteAppPath)' \
+                        'ExecStart=/usr/bin/dotnet $(remoteAppPath)/Api.TestGsm.dll' \
+                        'Restart=always' \
+                        'RestartSec=10' \
+                        'User=$(serviceUser)' \
+                        'Environment=ASPNETCORE_ENVIRONMENT=Production' \
+                        'NoNewPrivileges=true' \
+                        'PrivateTmp=true' \
+                        '' \
+                        '[Install]' \
+                        'WantedBy=multi-user.target' \
+                        | sudo tee "$SERVICE_FILE" >/dev/null
+
+                      sudo chmod 0644 "$SERVICE_FILE"
+                      sudo systemctl daemon-reload
+                      sudo systemctl enable "$(systemdServiceName)"
+                      sudo systemctl restart "$(systemdServiceName)"
+
+                      if sudo systemctl is-active --quiet "$(systemdServiceName)"; then
+                        sudo systemctl status "$(systemdServiceName)" --no-pager --full
+                        rm -f "$PACKAGE"
+                      else
+                        sudo systemctl status "$(systemdServiceName)" --no-pager --full || true
+                        sudo journalctl -u "$(systemdServiceName)" -n 80 --no-pager || true
+                        exit 1
+                      fi
