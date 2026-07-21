@@ -17,7 +17,7 @@ variables:
   remoteAppPath: /opt/ApiTestGsm/publish
   systemdServiceName: api-testgsm.service
   serviceUser: aprod
-  sshServiceConnection: prod-linux-api-test-gsm
+  sshServiceConnection: prod-linux-test-gsm-2
 
 stages:
   - stage: Build
