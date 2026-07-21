@@ -1,11 +1,10 @@
 trigger:
   branches:
     include:
-      - main
+      - master
 
 variables:
   buildConfiguration: Release
-  dotnetSdkVersion: 9.x
   agentPoolName: Default
   agentName: VM-DEVOPS
   projectPath: Api.TestGsm/Api.TestGsm.csproj
@@ -30,11 +29,19 @@ stages:
           demands:
             - agent.name -equals $(agentName)
         steps:
-          - task: UseDotNet@2
-            displayName: Install .NET SDK
+          - task: PowerShell@2
+            displayName: Check installed .NET SDK
             inputs:
-              packageType: sdk
-              version: $(dotnetSdkVersion)
+              targetType: inline
+              script: |
+                $sdkVersion = dotnet --version
+                if ($LASTEXITCODE -ne 0) {
+                  throw ".NET SDK is not installed on agent $(Agent.Name)."
+                }
+                if (-not $sdkVersion.StartsWith('9.')) {
+                  throw ".NET SDK 9.x is required by the test project. Installed version: $sdkVersion"
+                }
+                Write-Host "Using preinstalled .NET SDK $sdkVersion"
 
           - task: DotNetCoreCLI@2
             displayName: Restore
