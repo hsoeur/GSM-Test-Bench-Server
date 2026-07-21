@@ -1,5 +1,7 @@
-﻿using Microsoft.AspNetCore.Mvc;
+using Api.TestGsm.Configuration;
 using Api.TestGsm.Services;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 
 namespace Api.TestGsm.Controllers
 {
@@ -8,9 +10,12 @@ namespace Api.TestGsm.Controllers
     public class GsmController : Controller
     {
         private readonly IGsmService _gsm;
-        public GsmController(IGsmService gsm)
+        private readonly ApiResponseOptions _responses;
+
+        public GsmController(IGsmService gsm, IOptions<ApiResponseOptions> responses)
         {
             _gsm = gsm;
+            _responses = responses.Value;
         }
 
         [HttpPost("init")]
@@ -26,23 +31,28 @@ namespace Api.TestGsm.Controllers
             try
             {
                 _gsm.FourGModuleInitialization();
-                return Ok(new { success = true, message = "4G module initialized successfully" });
+                return Ok(new { success = true, message = RequiredResponse(_responses.Init4GSuccessMessage, "ApiResponses:Init4GSuccessMessage") });
             }
-            catch (InvalidOperationException ex) when (ex.Message.Contains("time out"))
+            catch (InvalidOperationException ex) when (ex.Message.Contains(RequiredResponse(_responses.TimeoutDetectionText, "ApiResponses:TimeoutDetectionText")))
             {
-                return StatusCode(504, new { success = false, error = "Modem timeout", details = ex.Message });
+                return StatusCode(504, new { success = false, error = RequiredResponse(_responses.ModemTimeoutError, "ApiResponses:ModemTimeoutError"), details = ex.Message });
             }
             catch (Exception ex)
             {
-                return StatusCode(500, new { success = false, error = "Initialization failed", details = ex.Message });
+                return StatusCode(500, new { success = false, error = RequiredResponse(_responses.InitializationFailedError, "ApiResponses:InitializationFailedError"), details = ex.Message });
             }
         }
 
         public record CallRequest(string phoneNumber, bool audioOk);
+
         [HttpPost("call")]
         public IActionResult Call([FromBody] CallRequest req)
         {
-            if (string.IsNullOrWhiteSpace(req.phoneNumber)) return BadRequest("phoneNumber required");
+            if (string.IsNullOrWhiteSpace(req.phoneNumber))
+            {
+                return BadRequest(RequiredResponse(_responses.PhoneNumberRequiredMessage, "ApiResponses:PhoneNumberRequiredMessage"));
+            }
+
             _gsm.LaunchTest(req.phoneNumber, req.audioOk);
             return Ok();
         }
@@ -54,14 +64,18 @@ namespace Api.TestGsm.Controllers
             return Ok();
         }
 
-        [HttpGet("health")] // simple health endpoint for client
+        [HttpGet("health")]
         public IActionResult Health()
         {
             var modem = _gsm.PingModem();
             var port = _gsm.IsPortOpen();
-            
+
             return Ok(new { api = true, portOpen = port, modemOk = modem });
-           
         }
+
+        private static string RequiredResponse(string? value, string key)
+            => string.IsNullOrWhiteSpace(value)
+                ? throw new InvalidOperationException($"Missing configuration value '{key}'.")
+                : value;
     }
 }

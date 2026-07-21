@@ -10,36 +10,32 @@ public class GsmService : IGsmService, IDisposable
     private readonly SerialPort _serialPort;
     private readonly string _portName;
     private readonly ILogger<GsmService> _logger;
+    private readonly GsmOptions _options;
     private readonly object _serialLock = new();
     private volatile bool _callCommandInProgress;
     private volatile bool _callActive;
-
-    private const int TIME_OUT_2SEC = 2000;
-    private const int TIME_OUT_5SEC = 5000;
-    private const int TIME_OUT_10SEC = 10000;
-    private const int TIME_OUT_15SEC = 15000;
-    private const int TIME_OUT_25SEC = 25000;
 
     public GsmService(IOptions<GsmOptions> options, ILogger<GsmService> logger)
     {
         _logger = logger;
 
-        var cfg = options.Value ?? new GsmOptions();
+        _options = options.Value ?? new GsmOptions();
 
-        // Choose default port per OS; override via configuration: Gsm:PortName
-        var defaultPort = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "COM3" : "/dev/ttyUSB0";
-        _portName = string.IsNullOrWhiteSpace(cfg.PortName) ? defaultPort : cfg.PortName;
+        var defaultPort = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? RequiredValue(_options.WindowsDefaultPortName, "Gsm:WindowsDefaultPortName")
+            : RequiredValue(_options.LinuxDefaultPortName, "Gsm:LinuxDefaultPortName");
+        _portName = string.IsNullOrWhiteSpace(_options.PortName) ? defaultPort : _options.PortName;
 
         _serialPort = new SerialPort(_portName)
         {
-            BaudRate = cfg.BaudRate ?? 9600,
-            DataBits = cfg.DataBits ?? 8,
-            StopBits = TryParseEnum(cfg.StopBits, StopBits.One),
-            Parity = TryParseEnum(cfg.Parity, Parity.None),
-            Handshake = TryParseEnum(cfg.Handshake, Handshake.None),
-            NewLine = string.IsNullOrEmpty(cfg.NewLine) ? "\n" : cfg.NewLine,
-            ReadTimeout = cfg.ReadTimeout ?? 5000,
-            WriteTimeout = cfg.WriteTimeout ?? 5000
+            BaudRate = RequiredValue(_options.BaudRate, "Gsm:BaudRate"),
+            DataBits = RequiredValue(_options.DataBits, "Gsm:DataBits"),
+            StopBits = TryParseEnum(_options.StopBits, StopBits.One),
+            Parity = TryParseEnum(_options.Parity, Parity.None),
+            Handshake = TryParseEnum(_options.Handshake, Handshake.None),
+            NewLine = RequiredValue(_options.NewLine, "Gsm:NewLine"),
+            ReadTimeout = RequiredValue(_options.ReadTimeout, "Gsm:ReadTimeout"),
+            WriteTimeout = RequiredValue(_options.WriteTimeout, "Gsm:WriteTimeout")
         };
         _logger.LogInformation("Configured serial port {Port} BaudRate={BaudRate} DataBits={DataBits} StopBits={StopBits} Parity={Parity} Handshake={Handshake} NewLine={NewLine} ReadTimeout={ReadTimeout} WriteTimeout={WriteTimeout}",
             _portName, _serialPort.BaudRate, _serialPort.DataBits, _serialPort.StopBits, _serialPort.Parity, _serialPort.Handshake, _serialPort.NewLine, _serialPort.ReadTimeout, _serialPort.WriteTimeout);
@@ -48,6 +44,101 @@ public class GsmService : IGsmService, IDisposable
 
     private static TEnum TryParseEnum<TEnum>(string? value, TEnum fallback) where TEnum : struct, Enum
     => Enum.TryParse<TEnum>(value, ignoreCase: true, out var parsed) ? parsed : fallback;
+
+    private static T RequiredValue<T>(T? value, string configurationKey)
+        => value is null
+            ? throw new InvalidOperationException($"Missing configuration value '{configurationKey}'.")
+            : value;
+
+    private static int RequiredValue(int? value, string configurationKey)
+        => value
+            ?? throw new InvalidOperationException($"Missing configuration value '{configurationKey}'.");
+
+    private static string RequiredValue(string? value, string configurationKey)
+        => string.IsNullOrEmpty(value)
+            ? throw new InvalidOperationException($"Missing configuration value '{configurationKey}'.")
+            : value;
+
+    private int ResolveTimeout(GsmCommandStep step)
+    {
+        if (step.TimeoutMs.HasValue)
+        {
+            return step.TimeoutMs.Value;
+        }
+
+        return step.TimeoutKey?.Trim().ToUpperInvariant() switch
+        {
+            "2S" => _options.Timeouts.TwoSecondsMs,
+            "5S" => _options.Timeouts.FiveSecondsMs,
+            "10S" => _options.Timeouts.TenSecondsMs,
+            "15S" => _options.Timeouts.FifteenSecondsMs,
+            "25S" => _options.Timeouts.TwentyFiveSecondsMs,
+            null or "" => _options.Timeouts.TwoSecondsMs,
+            var key => throw new InvalidOperationException($"Unknown GSM timeout key '{key}'.")
+        };
+    }
+
+    private void ExecuteSteps(IReadOnlyCollection<GsmCommandStep> steps, string configurationKey)
+    {
+        if (steps.Count == 0)
+        {
+            throw new InvalidOperationException($"Missing GSM command sequence '{configurationKey}'.");
+        }
+
+        foreach (var step in steps)
+        {
+            try
+            {
+                ExecuteStep(step, configurationKey);
+            }
+            catch when (step.ContinueOnFailure)
+            {
+                _logger.LogWarning("Configured GSM step failed but ContinueOnFailure=true for sequence {Sequence}", configurationKey);
+            }
+        }
+    }
+
+    private void TryExecuteConfiguredSteps(IReadOnlyCollection<GsmCommandStep> steps, string configurationKey)
+    {
+        if (steps.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            ExecuteSteps(steps, configurationKey);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Configured cleanup sequence {Sequence} failed", configurationKey);
+        }
+    }
+
+    private void ExecuteStep(GsmCommandStep step, string configurationKey)
+    {
+        var command = step.Command ?? string.Empty;
+        var timeoutMs = ResolveTimeout(step);
+
+        if (!string.IsNullOrEmpty(step.Payload))
+        {
+            ExecI2cWrite(command, step.Payload, timeoutMs);
+            return;
+        }
+
+        if (!string.IsNullOrEmpty(step.RequiredText))
+        {
+            ValidateCommandResponse(command, step.RequiredText, timeoutMs);
+            return;
+        }
+
+        if (step.ExpectedResponses.Length == 0)
+        {
+            throw new InvalidOperationException($"Configured GSM step in '{configurationKey}' must define ExpectedResponses, Payload, or RequiredText.");
+        }
+
+        ExecGsmCommandAny(command, step.ExpectedResponses, timeoutMs);
+    }
 
     private void EnsureOpen()
     {
@@ -58,8 +149,7 @@ public class GsmService : IGsmService, IDisposable
             _logger.LogInformation("Attempting to open serial port {Port} with BaudRate={BaudRate}", _portName, _serialPort.BaudRate);
             _serialPort.Open();
 
-            // Give the modem time to initialize after opening the port
-            Thread.Sleep(500);
+            Thread.Sleep(RequiredValue(_options.OpenDelayMs, "Gsm:OpenDelayMs"));
 
             _logger.LogInformation("Opened serial port {Port}", _portName);
         }
@@ -88,29 +178,12 @@ public class GsmService : IGsmService, IDisposable
             {
                 _callActive = false;
                 _logger.LogInformation("Starting test bench initialization");
-                ExecGsmCommand("AT\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT+CMEE=2\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT+CPIN?\r", "\r\n+CPIN: READY\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("ATZ\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                // Accept both with and without echo
-                ExecGsmCommandAny("ATE0&W\r", new[] { "ATE0&W\r\r\nOK\r\n", "\r\nOK\r\n" }, TIME_OUT_2SEC);
-                ExecGsmCommand("AT+CRC=1\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT+COLP=0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT+DDET=0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT+CHFA=2\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT+SIDET=2,0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT+CEXTERNTONE=0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT+ECHO?\r", "\r\n+ECHO: (0,96,253,16388,20488),(1,96,224,5256,20488)\r\n\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT+CMGF=1\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT+CSCS=\"IRA\"\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT+CREG?\r", "\r\n+CREG:0,1\r\n\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT+CGREG?\r", "\r\n+CGREG:0,1\r\n\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecuteSteps(_options.CommandSequences.TestBenchInitialization, "Gsm:CommandSequences:TestBenchInitialization");
                 _logger.LogInformation("Test bench initialization completed");
             }
             catch
             {
-                // ensure we leave port in sane state
-                try { ExecGsmCommand("AT+DDET=0\r", string.Empty, 0); } catch { }
+                TryExecuteConfiguredSteps(_options.CommandSequences.TestBenchInitializationFailureCleanup, "Gsm:CommandSequences:TestBenchInitializationFailureCleanup");
                 _logger.LogWarning("Initialization failed; ensured DTMF detection is disabled");
                 throw;
             }
@@ -126,35 +199,7 @@ public class GsmService : IGsmService, IDisposable
                 _callActive = false;
                 _logger.LogInformation("Starting 4G module initialization");
 
-                ExecGsmCommandAny("ATE0\r", new[] { "ATE0\r\r\nOK\r\n", "\r\nOK\r\n" }, TIME_OUT_2SEC);
-                ExecGsmCommand("AT+CPIN?\r", "\r\n+CPIN: READY\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT#ADSPC=1,0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT#DVICFG=0,1,2,1,2\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT#DVICFG=1,1,2,1,2\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT#DVI=1,2,1\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT#DVICLK=512,0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-
-                ExecI2cWrite("AT#I2CWR=3,2,30,4,19\r", "00101000240140002077404010502A0A400007\x1A", TIME_OUT_5SEC);
-                ExecI2cWrite("AT#I2CWR=3,2,30,17,1\r", "8A\x1A", TIME_OUT_5SEC);
-
-                ExecGsmCommand("AT+CVHU=0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-                ExecGsmCommand("AT#DIALMODE=2\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-
-                ValidateCommandResponse("AT+CSQ\r", "+CSQ:", TIME_OUT_5SEC);
-                ValidateCommandResponse("AT+CREG?\r", "+CREG:", TIME_OUT_5SEC);
-
-                // Try CEREG but don't fail if not supported
-                try
-                {
-                    ValidateCommandResponse("AT+CEREG?\r", "+CEREG:", TIME_OUT_5SEC);
-                    _logger.LogInformation("CEREG command supported");
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "CEREG command not supported or failed - continuing initialization");
-                }
-
-                ExecGsmCommand("AT#HFMICG=0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecuteSteps(_options.CommandSequences.FourGModuleInitialization, "Gsm:CommandSequences:FourGModuleInitialization");
 
                 _logger.LogInformation("4G module initialization completed");
             }
@@ -178,8 +223,8 @@ public class GsmService : IGsmService, IDisposable
             {
                 ExecGsmCommandAny(
                     BuildVoiceDialCommand(phoneNumber),
-                    new[] { "\r\nCONNECTED\r\n", "CONNECTED\r\n", "\r\nOK\r\n" },
-                    TIME_OUT_25SEC);
+                    RequiredValue(_options.CommandSequences.TestCallConnectedResponses, "Gsm:CommandSequences:TestCallConnectedResponses"),
+                    _options.Timeouts.TwentyFiveSecondsMs);
 
                 _callActive = true;
                 _logger.LogInformation("Call to {PhoneNumber} connected", phoneNumber);
@@ -188,27 +233,12 @@ public class GsmService : IGsmService, IDisposable
                 {
                     try
                     {
-                        ExecGsmCommand("AT+DDET=1\r", "\r\nOK\r\n", TIME_OUT_2SEC);
-
-                        // Accept OK-only (most modems) and optional +DTMF URC variants (vendor-dependent)
-                        ExecGsmCommandAny("AT+VTS=1\r",
-                            new[]
-                            {
-
-                                "\r\nOK\r\n",
-                                "\r\nOK\r\n\r\n+DTMF:1\r\n",
-                                "\r\nOK\r\n\r\n+DTMF:#\r\n",
-                                "\r\nOK\r\n\r\n+DTMF: #\r\n"
-
-                            },
-                            TIME_OUT_5SEC);
-
-                        ExecGsmCommand("AT+DDET=0\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                        ExecuteSteps(_options.CommandSequences.AudioMarker, "Gsm:CommandSequences:AudioMarker");
                     }
                     catch (Exception ex)
                     {
                         _logger.LogWarning(ex, "Call is connected, but audio marker command failed");
-                        try { ExecGsmCommand("AT+DDET=0\r", string.Empty, 0); } catch { }
+                        TryExecuteConfiguredSteps(_options.CommandSequences.AudioMarkerFailureCleanup, "Gsm:CommandSequences:AudioMarkerFailureCleanup");
                     }
                 }
 
@@ -218,7 +248,7 @@ public class GsmService : IGsmService, IDisposable
             {
                 _callActive = false;
                 _logger.LogError(ex, "Test call failed");
-                try { ExecGsmCommand("AT+DDET=0\r", string.Empty, 0); } catch { }
+                TryExecuteConfiguredSteps(_options.CommandSequences.TestCallFailureCleanup, "Gsm:CommandSequences:TestCallFailureCleanup");
                 _logger.LogWarning("Test call encountered an error; ensured DTMF detection is disabled");
                 throw;
             }
@@ -234,8 +264,7 @@ public class GsmService : IGsmService, IDisposable
         lock (_serialLock)
         {
             _logger.LogInformation("Hanging up call");
-            ExecGsmCommand("+++\r", string.Empty, 0);
-            ExecGsmCommand("ATH\r", string.Empty, 0);
+            ExecuteSteps(_options.CommandSequences.HangUp, "Gsm:CommandSequences:HangUp");
             _callActive = false;
             _callCommandInProgress = false;
         }
@@ -271,7 +300,7 @@ public class GsmService : IGsmService, IDisposable
                     return false;
                 }
 
-                ExecGsmCommand("AT\r", "\r\nOK\r\n", TIME_OUT_2SEC);
+                ExecuteSteps(_options.CommandSequences.Ping, "Gsm:CommandSequences:Ping");
                 _logger.LogInformation("Modem responded to ping");
                 return true;
             }
@@ -288,10 +317,12 @@ public class GsmService : IGsmService, IDisposable
         }
     }
 
-    private static string BuildVoiceDialCommand(string phoneNumber)
+    private string BuildVoiceDialCommand(string phoneNumber)
     {
         var normalizedPhoneNumber = phoneNumber.Trim().TrimEnd(';');
-        return $"ATDT{normalizedPhoneNumber};\r";
+        return string.Format(
+            RequiredValue(_options.Protocol.VoiceDialCommandFormat, "Gsm:Protocol:VoiceDialCommandFormat"),
+            normalizedPhoneNumber);
     }
 
     private void WriteOnSerialPort(byte[] data)
@@ -360,7 +391,7 @@ public class GsmService : IGsmService, IDisposable
                 return false;
             }
 
-            Thread.Sleep(10);  // Increased from 1ms to reduce CPU usage
+            Thread.Sleep(RequiredValue(_options.ReadPollingDelayMs, "Gsm:ReadPollingDelayMs"));
         }
 
         error = "Error time out";
@@ -398,7 +429,7 @@ public class GsmService : IGsmService, IDisposable
                 }
             }
 
-            Thread.Sleep(1);
+            Thread.Sleep(RequiredValue(_options.WaitForTextPollingDelayMs, "Gsm:WaitForTextPollingDelayMs"));
         }
 
         error = "Error time out";
@@ -438,7 +469,7 @@ public class GsmService : IGsmService, IDisposable
         {
             // Read with slack to absorb extra echoes or blank lines
             var expectedLines = expectedResponses.Max(r => r.Count(c => c == '\n'));
-            var maxLinesToRead = expectedLines + 5;
+            var maxLinesToRead = expectedLines + RequiredValue(_options.ExecGsmCommandSlackLines, "Gsm:ExecGsmCommandSlackLines");
 
             string? matchedVariant = null;
             for (int i = 0; i < maxLinesToRead; i++)
@@ -487,14 +518,14 @@ public class GsmService : IGsmService, IDisposable
         EnsureOpen();
         WriteOnSerialPort(Encoding.ASCII.GetBytes(command));
 
-        if (!WaitForText(">", out var promptResponse, out var promptError, receiveTimeOut))
+        if (!WaitForText(RequiredValue(_options.Protocol.I2cPrompt, "Gsm:Protocol:I2cPrompt"), out var promptResponse, out var promptError, receiveTimeOut))
         {
             _logger.LogError("I2C write prompt timeout for [{Command}] after {TimeoutMs} ms", command.Replace("\r", "\\r"), receiveTimeOut);
             throw new InvalidOperationException($"{promptError} [{command}]");
         }
 
         _logger.LogDebug("I2C write prompt received for [{Command}]: {Response}", command.Replace("\r", "\\r"), promptResponse.Replace("\r", "\\r").Replace("\n", "\\n"));
-        ExecGsmCommand(payload, "\r\nOK\r\n", receiveTimeOut);
+        ExecGsmCommand(payload, RequiredValue(_options.Protocol.OkResponse, "Gsm:Protocol:OkResponse"), receiveTimeOut);
     }
 
     private void ValidateCommandResponse(string command, string requiredText, int totalTimeoutMs)
@@ -507,7 +538,7 @@ public class GsmService : IGsmService, IDisposable
             response.Replace("\r", "\\r").Replace("\n", "\\n"));
 
         if (!response.Contains(requiredText, StringComparison.OrdinalIgnoreCase) ||
-            !response.Contains("\r\nOK\r\n", StringComparison.Ordinal))
+            !response.Contains(RequiredValue(_options.Protocol.OkResponse, "Gsm:Protocol:OkResponse"), StringComparison.Ordinal))
         {
             _logger.LogError(
                 "Incorrect response for [{Command}] => got: {Got} expected text: {ExpectedText} and OK",
@@ -532,7 +563,7 @@ public class GsmService : IGsmService, IDisposable
         var sb = new StringBuilder();
         var deadline = Environment.TickCount64 + totalTimeoutMs;
         var iterations = 0;
-        const int maxIterations = 100; // Safety limit
+        var maxIterations = RequiredValue(_options.ExecAndReadMaxIterations, "Gsm:ExecAndReadMaxIterations");
 
         while (Environment.TickCount64 <= deadline && iterations < maxIterations)
         {
@@ -540,12 +571,12 @@ public class GsmService : IGsmService, IDisposable
 
             try
             {
-                if (WaitResponse(out var line, out _, 1000))
+                if (WaitResponse(out var line, out _, RequiredValue(_options.ExecAndReadLineTimeoutMs, "Gsm:ExecAndReadLineTimeoutMs")))
                 {
                     sb.Append(line);
                     var agg = sb.ToString();
-                    if (agg.Contains("\r\nOK\r\n", StringComparison.Ordinal) ||
-                        agg.Contains("\r\nERROR\r\n", StringComparison.Ordinal))
+                    if (agg.Contains(RequiredValue(_options.Protocol.OkResponse, "Gsm:Protocol:OkResponse"), StringComparison.Ordinal) ||
+                        agg.Contains(RequiredValue(_options.Protocol.ErrorResponse, "Gsm:Protocol:ErrorResponse"), StringComparison.Ordinal))
                     {
                         break;
                     }
@@ -564,12 +595,12 @@ public class GsmService : IGsmService, IDisposable
         return res;
     }
 
-    private static bool TryParseClccStat(string line, out int stat)
+    private static bool TryParseClccStat(string line, string clccPrefix, out int stat)
     {
         stat = -1;
-        var idx = line.IndexOf("+CLCC:", StringComparison.OrdinalIgnoreCase);
+        var idx = line.IndexOf(clccPrefix, StringComparison.OrdinalIgnoreCase);
         if (idx < 0) return false;
-        var rest = line[(idx + 6)..];
+        var rest = line[(idx + clccPrefix.Length)..];
         var tokens = rest.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         if (tokens.Length >= 3 && int.TryParse(tokens[2], out stat)) return true;
         return false;
@@ -579,7 +610,7 @@ public class GsmService : IGsmService, IDisposable
     {
         var deadline = Environment.TickCount64 + timeoutMs;
         var callAttempts = 0;
-        const int maxCallAttempts = 25;  // Avoid infinite loop
+        var maxCallAttempts = RequiredValue(_options.CallStatusMaxAttempts, "Gsm:CallStatusMaxAttempts");
 
         while (Environment.TickCount64 <= deadline && callAttempts < maxCallAttempts)
         {
@@ -587,7 +618,11 @@ public class GsmService : IGsmService, IDisposable
 
             try
             {
-                var resp = ExecAndRead("AT+CLCC\r", TIME_OUT_5SEC);  // Increased from 2 to 5 seconds
+                var statusSteps = _options.CommandSequences.WaitForVoiceConnectedStatus;
+                var statusStep = statusSteps.Count > 0
+                    ? statusSteps[0]
+                    : throw new InvalidOperationException("Missing GSM command sequence 'Gsm:CommandSequences:WaitForVoiceConnectedStatus'.");
+                var resp = ExecAndRead(RequiredValue(statusStep.Command, "Gsm:CommandSequences:WaitForVoiceConnectedStatus:0:Command"), ResolveTimeout(statusStep));
 
                 _logger.LogDebug("WaitForVoiceConnected attempt {Attempt}: {Response}",
                     callAttempts,
@@ -595,7 +630,8 @@ public class GsmService : IGsmService, IDisposable
 
                 foreach (var line in resp.Split('\n'))
                 {
-                    if (line.Contains("+CLCC:", StringComparison.OrdinalIgnoreCase) && TryParseClccStat(line, out var stat))
+                    if (line.Contains(RequiredValue(_options.Protocol.ClccPrefix, "Gsm:Protocol:ClccPrefix"), StringComparison.OrdinalIgnoreCase) &&
+                        TryParseClccStat(line, RequiredValue(_options.Protocol.ClccPrefix, "Gsm:Protocol:ClccPrefix"), out var stat))
                     {
                         // stat:0=active,2=dialing,3=alerting,4=incoming,5=waiting
                         if (stat == 0)
@@ -608,9 +644,9 @@ public class GsmService : IGsmService, IDisposable
                             _logger.LogDebug("Call status: stat={Stat}", stat);
                         }
                     }
-                    if (line.Contains("NO CARRIER", StringComparison.OrdinalIgnoreCase) ||
-                        line.Contains("BUSY", StringComparison.OrdinalIgnoreCase) ||
-                        line.Contains("NO ANSWER", StringComparison.OrdinalIgnoreCase))
+                    if (line.Contains(RequiredValue(_options.Protocol.NoCarrierText, "Gsm:Protocol:NoCarrierText"), StringComparison.OrdinalIgnoreCase) ||
+                        line.Contains(RequiredValue(_options.Protocol.BusyText, "Gsm:Protocol:BusyText"), StringComparison.OrdinalIgnoreCase) ||
+                        line.Contains(RequiredValue(_options.Protocol.NoAnswerText, "Gsm:Protocol:NoAnswerText"), StringComparison.OrdinalIgnoreCase))
                     {
                         _logger.LogWarning("Call failed: {Line}", line.Trim());
                         return false;
@@ -622,7 +658,7 @@ public class GsmService : IGsmService, IDisposable
                 _logger.LogWarning(ex, "Error checking call status on attempt {Attempt}", callAttempts);
             }
 
-            Thread.Sleep(500);
+            Thread.Sleep(RequiredValue(_options.CallStatusPollingDelayMs, "Gsm:CallStatusPollingDelayMs"));
         }
 
         _logger.LogWarning("Call did not connect after {Attempts} attempts / {TimeoutMs}ms", callAttempts, timeoutMs);

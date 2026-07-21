@@ -10,16 +10,21 @@ public class GsmSimulatorService : IGsmService, IDisposable
 {
     private readonly ILogger<GsmSimulatorService> _logger;
     private readonly GsmSimulatorOptions _options;
+    private readonly GsmOptions _gsmOptions;
     private bool _isInitialized;
     private bool _isInCall;
     private string? _currentPhoneNumber;
     private DateTime? _callStartTime;
     private readonly Random _random = new();
 
-    public GsmSimulatorService(IOptions<GsmSimulatorOptions> options, ILogger<GsmSimulatorService> logger)
+    public GsmSimulatorService(
+        IOptions<GsmSimulatorOptions> options,
+        IOptions<GsmOptions> gsmOptions,
+        ILogger<GsmSimulatorService> logger)
     {
         _logger = logger;
         _options = options.Value ?? new GsmSimulatorOptions();
+        _gsmOptions = gsmOptions.Value ?? new GsmOptions();
 
         _logger.LogInformation(
             "GSM Simulator initialized. SimulateFailures={SimulateFailures}, CallConnectDelayMs={CallConnectDelayMs}",
@@ -40,23 +45,7 @@ public class GsmSimulatorService : IGsmService, IDisposable
         // Simulate AT command processing delay
         Thread.Sleep(_options.CommandDelayMs);
 
-        // Simulate the sequence of AT commands
-        SimulateCommand("AT");
-        SimulateCommand("AT+CMEE=2");
-        SimulateCommand("AT+CPIN?");
-        SimulateCommand("ATZ");
-        SimulateCommand("ATE0&W");
-        SimulateCommand("AT+CRC=1");
-        SimulateCommand("AT+COLP=0");
-        SimulateCommand("AT+DDET=0");
-        SimulateCommand("AT+CHFA=2");
-        SimulateCommand("AT+SIDET=2,0");
-        SimulateCommand("AT+CEXTERNTONE=0");
-        SimulateCommand("AT+ECHO?");
-        SimulateCommand("AT+CMGF=1");
-        SimulateCommand("AT+CSCS=\"IRA\"");
-        SimulateCommand("AT+CREG?");
-        SimulateCommand("AT+CGREG?");
+        SimulateSteps(_gsmOptions.CommandSequences.TestBenchInitialization, "Gsm:CommandSequences:TestBenchInitialization");
 
         _isInitialized = true;
         _logger.LogInformation("Simulated test bench initialization completed successfully");
@@ -74,22 +63,7 @@ public class GsmSimulatorService : IGsmService, IDisposable
 
         Thread.Sleep(_options.CommandDelayMs);
 
-        SimulateCommand("ATE0");
-        SimulateCommand("AT+CPIN?");
-        SimulateCommand("AT#ADSPC=1,0");
-        SimulateCommand("AT#DVICFG=0,1,2,1,2");
-        SimulateCommand("AT#DVICFG=1,1,2,1,2");
-        SimulateCommand("AT#DVI=1,2,1");
-        SimulateCommand("AT#DVICLK=512,0");
-        SimulateCommand("AT#I2CWR=3,2,30,4,19");
-        SimulateCommand("00101000240140002077404010502A0A400007");
-        SimulateCommand("AT#I2CWR=3,2,30,17,1");
-        SimulateCommand("8A");
-        SimulateCommand("AT+CVHU=0");
-        SimulateCommand("AT#DIALMODE=2");
-        SimulateCommand("AT+CSQ");
-        SimulateCommand("AT+CREG?");
-        SimulateCommand("AT+CEREG?");
+        SimulateSteps(_gsmOptions.CommandSequences.FourGModuleInitialization, "Gsm:CommandSequences:FourGModuleInitialization");
 
         _isInitialized = true;
         _logger.LogInformation("Simulated 4G module initialization completed successfully");
@@ -134,10 +108,10 @@ public class GsmSimulatorService : IGsmService, IDisposable
         // Simulate call connection failure
         if (_options.SimulateFailures && _random.Next(100) < _options.CallFailurePercentage)
         {
-            _logger.LogWarning("Simulated call connection failure (BUSY/NO CARRIER)");
+            _logger.LogWarning("Simulated call connection failure");
             _isInCall = false;
             _currentPhoneNumber = null;
-            throw new InvalidOperationException("Simulated call failure: NO CARRIER");
+            throw new InvalidOperationException(RequiredValue(_options.CallFailureMessage, "GsmSimulator:CallFailureMessage"));
         }
 
         _callStartTime = DateTime.UtcNow;
@@ -145,10 +119,7 @@ public class GsmSimulatorService : IGsmService, IDisposable
 
         if (audioOk)
         {
-            // Simulate DTMF detection
-            SimulateCommand("AT+DDET=1");
-            SimulateCommand("AT+VTS=1");
-            SimulateCommand("AT+DDET=0");
+            SimulateSteps(_gsmOptions.CommandSequences.AudioMarker, "Gsm:CommandSequences:AudioMarker");
             _logger.LogDebug("Simulated DTMF tone sent");
         }
     }
@@ -170,8 +141,7 @@ public class GsmSimulatorService : IGsmService, IDisposable
             _currentPhoneNumber,
             callDuration);
 
-        SimulateCommand("+++");
-        SimulateCommand("ATH");
+        SimulateSteps(_gsmOptions.CommandSequences.HangUp, "Gsm:CommandSequences:HangUp");
 
         _isInCall = false;
         _currentPhoneNumber = null;
@@ -196,9 +166,30 @@ public class GsmSimulatorService : IGsmService, IDisposable
             return false;
         }
 
-        SimulateCommand("AT");
+        SimulateSteps(_gsmOptions.CommandSequences.Ping, "Gsm:CommandSequences:Ping");
         _logger.LogInformation("Simulated modem responded to ping");
         return true;
+    }
+
+    private void SimulateSteps(IReadOnlyCollection<GsmCommandStep> steps, string configurationKey)
+    {
+        if (steps.Count == 0)
+        {
+            throw new InvalidOperationException($"Missing GSM command sequence '{configurationKey}'.");
+        }
+
+        foreach (var step in steps)
+        {
+            if (!string.IsNullOrEmpty(step.Command))
+            {
+                SimulateCommand(step.Command);
+            }
+
+            if (!string.IsNullOrEmpty(step.Payload))
+            {
+                SimulateCommand(step.Payload);
+            }
+        }
     }
 
     private void SimulateCommand(string command)
@@ -214,11 +205,18 @@ public class GsmSimulatorService : IGsmService, IDisposable
         _logger.LogTrace("Simulated RX <- OK");
     }
 
-    private static string BuildVoiceDialCommand(string phoneNumber)
+    private string BuildVoiceDialCommand(string phoneNumber)
     {
         var normalizedPhoneNumber = phoneNumber.Trim().TrimEnd(';');
-        return $"ATDT{normalizedPhoneNumber};";
+        return string.Format(
+            RequiredValue(_gsmOptions.Protocol.VoiceDialCommandFormat, "Gsm:Protocol:VoiceDialCommandFormat"),
+            normalizedPhoneNumber);
     }
+
+    private static string RequiredValue(string? value, string configurationKey)
+        => string.IsNullOrWhiteSpace(value)
+            ? throw new InvalidOperationException($"Missing configuration value '{configurationKey}'.")
+            : value;
 
     public void Dispose()
     {
@@ -266,4 +264,9 @@ public sealed class GsmSimulatorOptions
     /// Percentage chance (0-100) of ping failure when SimulateFailures is true
     /// </summary>
     public int PingFailurePercentage { get; set; } = 5;
+
+    /// <summary>
+    /// Exception message raised when a simulated call cannot connect.
+    /// </summary>
+    public string? CallFailureMessage { get; set; }
 }

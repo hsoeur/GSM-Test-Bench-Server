@@ -1,19 +1,19 @@
+using Api.TestGsm.Configuration;
 using Serilog;
 using Serilog.Events;
 
 var builder = WebApplication.CreateBuilder(args);
+var appOptions = builder.Configuration.GetSection("App").Get<AppOptions>() ?? new AppOptions();
+var serilogOptions = builder.Configuration.GetSection("SerilogFile").Get<SerilogFileOptions>() ?? new SerilogFileOptions();
 
-// Listen on port5001 on all interfaces
-builder.WebHost.UseUrls("http://0.0.0.0:5001");
-
-// Create daily logs directory and incremented filename per app start
-string logsRoot = Path.Combine(AppContext.BaseDirectory, "logs");
-string dayFolderName = DateTime.UtcNow.ToString("yyyy-MM-dd");
+string logsRoot = Path.Combine(AppContext.BaseDirectory, RequireConfig(serilogOptions.LogsDirectoryName, "SerilogFile:LogsDirectoryName"));
+string dayFolderName = DateTime.UtcNow.ToString(RequireConfig(serilogOptions.DayFolderFormat, "SerilogFile:DayFolderFormat"));
 string dayFolder = Path.Combine(logsRoot, dayFolderName);
 Directory.CreateDirectory(dayFolder);
 
 int restartNumber = 1;
-var existing = Directory.EnumerateFiles(dayFolder, $"log-{dayFolderName}-*.log")
+var logFileNameFormat = RequireConfig(serilogOptions.FileNameFormat, "SerilogFile:FileNameFormat");
+var existing = Directory.EnumerateFiles(dayFolder, string.Format(logFileNameFormat, dayFolderName, "*"))
     .Select(p => Path.GetFileNameWithoutExtension(p))
     .Select(name =>
     {
@@ -26,26 +26,28 @@ var existing = Directory.EnumerateFiles(dayFolder, $"log-{dayFolderName}-*.log")
     .Max();
 restartNumber = existing + 1;
 
-string logFilePath = Path.Combine(dayFolder, $"log-{dayFolderName}-{restartNumber}.log");
+string logFilePath = Path.Combine(dayFolder, string.Format(logFileNameFormat, dayFolderName, restartNumber));
+var frameworkMinimumLevel = Enum.Parse<LogEventLevel>(
+    RequireConfig(serilogOptions.FrameworkMinimumLevel, "SerilogFile:FrameworkMinimumLevel"),
+    ignoreCase: true);
 
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Debug()
-    // Reduce noise from framework sources
-    .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
-    .MinimumLevel.Override("Microsoft.AspNetCore", LogEventLevel.Warning)
-    .MinimumLevel.Override("System", LogEventLevel.Warning)
+    .MinimumLevel.Override("Microsoft", frameworkMinimumLevel)
+    .MinimumLevel.Override("Microsoft.AspNetCore", frameworkMinimumLevel)
+    .MinimumLevel.Override("System", frameworkMinimumLevel)
     .Enrich.FromLogContext()
     .Enrich.WithProperty("RestartNumber", restartNumber)
     .WriteTo.Console(outputTemplate:
-        "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
+        RequireConfig(serilogOptions.ConsoleOutputTemplate, "SerilogFile:ConsoleOutputTemplate"))
     .WriteTo.File(
         path: logFilePath,
         restrictedToMinimumLevel: LogEventLevel.Debug,
         rollingInterval: RollingInterval.Infinite,
         shared: true,
-        flushToDiskInterval: TimeSpan.FromSeconds(1),
+        flushToDiskInterval: TimeSpan.FromSeconds(serilogOptions.FlushToDiskIntervalSeconds),
         outputTemplate:
-            "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level:u3}] {SourceContext} {Message:lj}{NewLine}{Exception}")
+            RequireConfig(serilogOptions.FileOutputTemplate, "SerilogFile:FileOutputTemplate"))
     .CreateLogger();
 
 builder.Host.UseSerilog();
@@ -53,16 +55,16 @@ builder.Host.UseSerilog();
 // Bind GSM options from configuration
 builder.Services.Configure<Api.TestGsm.Services.GsmOptions>(builder.Configuration.GetSection("Gsm"));
 builder.Services.Configure<Api.TestGsm.Services.GsmSimulatorOptions>(builder.Configuration.GetSection("GsmSimulator"));
+builder.Services.Configure<ApiResponseOptions>(builder.Configuration.GetSection("ApiResponses"));
 
 // Add services to the container.
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-// CORS: allow any origin, method, and header (adjust for production as needed)
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("AllowAll", policy =>
+    options.AddPolicy(RequireConfig(appOptions.CorsPolicyName, "App:CorsPolicyName"), policy =>
         policy.AllowAnyOrigin()
               .AllowAnyMethod()
               .AllowAnyHeader());
@@ -83,18 +85,22 @@ else
 
 var app = builder.Build();
 
-// Always enable Swagger and serve UI under /swagger
-app.UseSwagger();
-app.UseSwaggerUI(); // RoutePrefix defaults to "swagger"
+if (appOptions.EnableSwagger)
+{
+    app.UseSwagger();
+    app.UseSwaggerUI(options =>
+    {
+        options.RoutePrefix = RequireConfig(appOptions.SwaggerRoutePrefix, "App:SwaggerRoutePrefix");
+    });
+}
 
-// Optional: redirect root to Swagger UI
-app.MapGet("/", () => Results.Redirect("/swagger"));
+app.MapGet("/", () => Results.Redirect(RequireConfig(appOptions.RootRedirectPath, "App:RootRedirectPath")));
 
 // If you only use HTTP, keep HTTPS redirection disabled
 // app.UseHttpsRedirection();
 
 // Apply CORS globally
-app.UseCors("AllowAll");
+app.UseCors(RequireConfig(appOptions.CorsPolicyName, "App:CorsPolicyName"));
 
 app.UseAuthorization();
 
@@ -113,3 +119,8 @@ finally
 {
     Log.CloseAndFlush();
 }
+
+static string RequireConfig(string? value, string key)
+    => string.IsNullOrWhiteSpace(value)
+        ? throw new InvalidOperationException($"Missing configuration value '{key}'.")
+        : value;

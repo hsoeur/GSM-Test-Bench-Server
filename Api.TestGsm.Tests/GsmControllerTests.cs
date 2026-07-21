@@ -1,8 +1,10 @@
 using Xunit;
 using Moq;
 using Api.TestGsm.Controllers;
+using Api.TestGsm.Configuration;
 using Api.TestGsm.Services;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 using System.Collections.Generic;
 
 namespace Api.TestGsm.Tests
@@ -15,7 +17,16 @@ namespace Api.TestGsm.Tests
         public GsmControllerTests()
         {
             _mockService = new Mock<IGsmService>();
-            _controller = new GsmController(_mockService.Object);
+            _controller = new GsmController(
+                _mockService.Object,
+                Options.Create(new ApiResponseOptions
+                {
+                    Init4GSuccessMessage = "4G module initialized successfully",
+                    ModemTimeoutError = "Modem timeout",
+                    InitializationFailedError = "Initialization failed",
+                    PhoneNumberRequiredMessage = "phoneNumber required",
+                    TimeoutDetectionText = "time out"
+                }));
         }
 
         [Fact]
@@ -30,7 +41,7 @@ namespace Api.TestGsm.Tests
         public void Init4G_ReturnsOk_AndCallsService()
         {
             var result = _controller.Init4G();
-            Assert.IsType<OkResult>(result);
+            Assert.IsType<OkObjectResult>(result);
             _mockService.Verify(s => s.FourGModuleInitialization(), Times.Once);
         }
 
