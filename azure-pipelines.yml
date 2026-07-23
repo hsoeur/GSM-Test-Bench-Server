@@ -3,6 +3,17 @@ trigger:
     include:
       - master
 
+parameters:
+  - name: productionTargets
+    type: object
+    default:
+      - jobName: DeployProductionServer2
+        displayName: Deploy API - serveur 2
+        sshServiceConnection: prod-linux-test-gsm-2
+      - jobName: DeployProductionServer1
+        displayName: Deploy API - serveur 1
+        sshServiceConnection: prod-linux-test-gsm-1
+
 variables:
   buildConfiguration: Release
   agentPoolName: Default
@@ -16,7 +27,6 @@ variables:
   remoteAppPath: /opt/ApiTestGsm/publish
   systemdServiceName: api-testgsm.service
   serviceUser: aprod
-  sshServiceConnection: prod-linux-test-gsm-2
 
 stages:
   - stage: Build
@@ -88,17 +98,18 @@ stages:
     dependsOn: Build
     condition: succeeded()
     jobs:
-      - deployment: DeployProduction
-        displayName: Deploy API
-        environment: production
-        pool:
-          name: $(agentPoolName)
-          demands:
-            - agent.name -equals $(agentName)
-        strategy:
-          runOnce:
-            deploy:
-              steps:
+      - ${{ each target in parameters.productionTargets }}:
+        - deployment: ${{ target.jobName }}
+          displayName: ${{ target.displayName }}
+          environment: production
+          pool:
+            name: $(agentPoolName)
+            demands:
+              - agent.name -equals $(agentName)
+          strategy:
+            runOnce:
+              deploy:
+                steps:
                 - task: DownloadBuildArtifacts@0
                   displayName: Download artifact
                   inputs:
@@ -110,7 +121,7 @@ stages:
                 - task: SSH@0
                   displayName: Prepare remote directory
                   inputs:
-                    sshEndpoint: $(sshServiceConnection)
+                    sshEndpoint: ${{ target.sshServiceConnection }}
                     runOptions: inline
                     inline: |
                       set -euo pipefail
@@ -120,7 +131,7 @@ stages:
                 - task: CopyFilesOverSSH@0
                   displayName: Copy package to target
                   inputs:
-                    sshEndpoint: $(sshServiceConnection)
+                    sshEndpoint: ${{ target.sshServiceConnection }}
                     sourceFolder: $(System.ArtifactsDirectory)/$(artifactName)
                     contents: $(packageName)
                     targetFolder: $(remoteTempPath)
@@ -130,7 +141,7 @@ stages:
                 - task: SSH@0
                   displayName: Install and restart service
                   inputs:
-                    sshEndpoint: $(sshServiceConnection)
+                    sshEndpoint: ${{ target.sshServiceConnection }}
                     runOptions: inline
                     failOnStdErr: false
                     inline: |
