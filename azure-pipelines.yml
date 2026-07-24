@@ -143,6 +143,7 @@ stages:
                   inputs:
                     sshEndpoint: ${{ target.sshServiceConnection }}
                     runOptions: inline
+                    interactiveSession: true
                     failOnStdErr: false
                     inline: |
                       set -euo pipefail
